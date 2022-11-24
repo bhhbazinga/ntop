@@ -1,0 +1,279 @@
+#! /usr/bin/python3
+
+from __future__ import print_function
+from bcc import BPF
+from time import sleep
+import argparse
+import signal
+import traceback
+import socket
+import struct
+import ctypes
+import psutil
+
+bpf_text = """
+#include <uapi/linux/ptrace.h>
+#include <net/sock.h>
+#include <bcc/proto.h>
+
+#define UDP_PROTOCOL 0x11
+#define TCP_PROTOCOL 0x06
+
+struct iphdr {
+	u8	version:4,
+      		ihl:4;
+	u8	tos;
+	u16	tot_len;
+	u16	id;
+	u16	frag_off;
+	u8	ttl;
+	u8	protocol;
+	u16	check;
+	u32	saddr;
+	u32	daddr;
+};
+
+struct transhdr {
+    u16 source;
+    u16 dest;
+    u8  extra[0];
+};
+
+struct traffic_key {
+    u32 pid;
+    u8  protocol;
+    u32 daddr;
+    u16 dport;
+};
+
+BPF_HASH(tx_bytes, struct traffic_key);
+BPF_HASH(rx_bytes, struct traffic_key);
+BPF_HASH(laddr2ifindex, u32, int);
+
+void trace_ip_finish_output(struct pt_regs *ctx,
+                            struct net *net, struct sock *sk, struct sk_buff *skb)
+{
+    struct iphdr *iph = (struct iphdr *)(skb->head + skb->network_header);
+	struct transhdr *transh = (struct transhdr *)(skb->head + skb->transport_header);
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    struct traffic_key key;
+
+    if (sk->sk_family != AF_INET)
+        return;
+
+    if (FILTER_IFINDEX != 0 && FILTER_IFINDEX != skb->dev->ifindex)
+        return;
+
+    if (iph->protocol != TCP_PROTOCOL && iph->protocol != UDP_PROTOCOL)
+        return;
+
+    if (FILTER_PROTOCOL != 0 && FILTER_PROTOCOL != iph->protocol)
+        return;
+
+    if (FILTER_PORT != 0 && FILTER_PORT != transh->dest)
+        return;
+
+    memset(&key, 0, sizeof(key));
+    key.pid = pid;
+    key.protocol = iph->protocol;
+    key.daddr = iph->daddr;
+    key.dport = transh->dest;
+
+    u16 len = iph->tot_len;
+    tx_bytes.increment(key, ntohs(len));
+}
+
+void trace_tcp_cleanup_rbuf(struct pt_regs *ctx, struct sock *sk, int copied)
+{
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u32 laddr = sk->sk_rcv_saddr;
+    int *ifindex = laddr2ifindex.lookup(&laddr);
+    struct traffic_key key;
+
+    if (sk->sk_family != AF_INET)
+        return;
+    
+    if (copied <= 0)
+        return;
+
+    if (FILTER_IFINDEX != 0 && (!ifindex || *ifindex != FILTER_IFINDEX))
+        return;
+
+    if (FILTER_PORT != 0 && FILTER_PORT != sk->sk_dport)
+        return;
+
+    memset(&key, 0, sizeof(key));
+    key.pid = pid;
+    key.protocol = TCP_PROTOCOL;
+    key.daddr = sk->sk_daddr;
+    key.dport = sk->sk_dport;
+    rx_bytes.increment(key, copied + 40);
+}
+
+void trace_skb_consume_udp(struct pt_regs *ctx,
+                           struct sock *sk, struct sk_buff *skb, int size)
+{
+    struct iphdr *iph = (struct iphdr *)(skb->head + skb->network_header);
+	struct transhdr *transh = (struct transhdr *)(skb->head + skb->transport_header);
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    struct traffic_key key;
+
+    if (sk->sk_family != AF_INET)
+        return;
+
+    if (size <= 0)
+        return;
+
+    if (FILTER_IFINDEX != 0 && FILTER_IFINDEX != skb->skb_iif)
+        return;
+
+    if (FILTER_PORT != 0 && FILTER_PORT != transh->source)
+        return;
+
+    memset(&key, 0, sizeof(key));
+    key.pid = pid;
+    key.protocol = UDP_PROTOCOL;
+    key.daddr = iph->saddr;
+    key.dport = transh->source;
+    u16 len = iph->tot_len;
+    rx_bytes.increment(key, ntohs(len));
+}
+"""
+
+class Tool(object):
+    def __init__(self):
+        examples = """examples:
+        ./ntop -i eth0 -t -p 443 -n 20 -s 5"
+        """
+        parser = argparse.ArgumentParser(
+            description = "bpfcc tool, used to show top n traffic",
+            formatter_class = argparse.RawDescriptionHelpFormatter,
+            epilog = examples)
+
+        parser.add_argument("-i", "--interface", help = "capture interface name", type = str, default = "any")
+        parser.add_argument("-t", "--tcp", help = "capture tcp traffic", action = "store_true")
+        parser.add_argument("-u", "--udp", help = "capture udp traffic", action = "store_true")
+        parser.add_argument("-p", "--port", help = "capture remote port", type = int, default = 0)
+        parser.add_argument("-n", "--number", help = "show n top traffic", type = int, default = 10)
+        parser.add_argument("-s", "--second", help = "time interval, seconds", type = int, default = 2)
+
+        self.args = parser.parse_args()
+
+        if self.args.interface == "any":
+            ifindex = 0
+        else:
+            ifindex = socket.if_nametoindex(self.args.interface)
+
+        if not self.args.tcp and not self.args.udp:
+            self.args.tcp = True
+            self.args.udp = True
+
+        global bpf_text
+        bpf_text = bpf_text.replace("FILTER_IFINDEX", str(ifindex))
+        bpf_text = bpf_text.replace("FILTER_PORT", str(socket.htons(self.args.port)))
+        if self.args.tcp and self.args.udp:
+            bpf_text = bpf_text.replace("FILTER_PROTOCOL", "0")
+        elif self.args.tcp:
+            bpf_text = bpf_text.replace("FILTER_PROTOCOL", "0x06")
+        else:
+            bpf_text = bpf_text.replace("FILTER_PROTOCOL", "0x11")
+        self.bpf = BPF(text=bpf_text)
+
+        if_addrs = psutil.net_if_addrs()
+        laddr2ifindex = self.bpf["laddr2ifindex"]
+        for ifname in if_addrs:
+            addrs = if_addrs[ifname]
+            ifindex = socket.if_nametoindex(ifname.split(":")[0])
+            for addr in addrs:
+                if addr.family.name == 'AF_INET':
+                    laddr = int.from_bytes(socket.inet_aton(addr.address), byteorder="little")
+                    laddr2ifindex[ctypes.c_uint32(laddr)] = ctypes.c_int(ifindex)
+
+    @staticmethod
+    def _signal_ignore(signal, frame):
+        print()
+
+    def attach(self):
+        if self.args.tcp:
+            self.bpf.attach_kprobe(event = "tcp_cleanup_rbuf", fn_name = "trace_tcp_cleanup_rbuf")
+
+        if self.args.udp:
+            self.bpf.attach_kprobe(event = "skb_consume_udp", fn_name = "trace_skb_consume_udp")
+
+        self.bpf.attach_kprobe(event = "ip_finish_output", fn_name = "trace_ip_finish_output")
+
+    def detach(self):
+        if self.args.tcp:
+            self.bpf.detach_kprobe(event="tcp_cleanup_rbuf")
+
+        if self.args.udp:
+            self.bpf.detach_kprobe(event="skb_consume_udp")
+
+        self.bpf.detach_kprobe(event="ip_finish_output")
+
+    def run(self):
+        print("start record traffic\"... Hit Ctrl-C to end.")
+
+        exiting = 0
+        while True:
+            self.attach()
+            try:
+                sleep(self.args.second)
+            except KeyboardInterrupt:
+                exiting = 1
+                # as cleanup can take many seconds, trap Ctrl-C:
+                signal.signal(signal.SIGINT, Tool._signal_ignore)
+            self.detach()
+
+            tx_bytes = self.bpf["tx_bytes"]
+            rx_bytes = self.bpf["rx_bytes"]
+
+            traffic_infos = {}
+            def merge_traffic(dir, dir_bytes):
+                for k, v in dir_bytes.items():
+                    addr = (k.daddr << 32) | (k.dport << 16) | k.protocol
+                    pid = k.pid
+                    if addr not in traffic_infos:
+                        traffic_infos[addr] = {
+                            "protocol": k.protocol == 0x06 and "tcp" or "udp",
+                            "address": "%s:%d" % (socket.inet_ntoa(struct.pack("I", k.daddr)), socket.ntohs(k.dport)),
+                            "tx" : 0,
+                            "rx" : 0,
+                            "comm" : set()
+                        }
+                    traffic_infos[addr][dir] = traffic_infos[addr][dir] + v.value
+                    try:
+                        comm = open("/proc/%d/comm" % pid, "r").read().rstrip()
+                        if comm not in traffic_infos[addr]["comm"]:
+                            traffic_infos[addr]["comm"].add(comm)
+                    except Exception:
+                            continue
+
+            merge_traffic("tx", tx_bytes)
+            merge_traffic("rx", rx_bytes)
+
+            print("%-10s %20s %10s %10s %20s" % ("PROTOCOL", "ADDRESS", "TX B/s", "RX B/s", "COMM"))
+            n = 0
+            for _, v in sorted(traffic_infos.items(), key=lambda tup: tup[1]["tx"]+tup[1]["rx"], reverse=True):
+                comm_str = ",".join(v["comm"])
+                print("%-10s %20s %10d %10d %20s" %
+                     (v["protocol"],
+                     v["address"],
+                     v["tx"]  / self.args.second,
+                     v["rx"]  / self.args.second,
+                     comm_str))
+                n = n + 1
+                if n >= self.args.number:
+                    break
+            if exiting:
+                print("Detaching...")
+                exit()
+            else:
+                tx_bytes.clear()
+                rx_bytes.clear()
+
+if __name__ == "__main__":
+    try:
+        Tool().run()
+    except Exception:
+        traceback.print_exc()
