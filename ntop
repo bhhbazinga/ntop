@@ -239,7 +239,7 @@ class Tool(object):
                             "comm" : set()
                         }
                     traffic_infos[addr][dir] = traffic_infos[addr][dir] + v.value
-                    if comm not in traffic_infos[addr]["comm"]:
+                    if not (comm.startswith("swapper") or comm.startswith("ksoftirqd")) and comm not in traffic_infos[addr]["comm"]:
                         traffic_infos[addr]["comm"].add(comm)
 
             merge_traffic("tx", tx_bytes)
