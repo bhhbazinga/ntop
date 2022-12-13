@@ -40,7 +40,7 @@ struct transhdr {
 };
 
 struct traffic_key {
-    u32 pid;
+    char comm[16];
     u8  protocol;
     u32 daddr;
     u16 dport;
@@ -55,7 +55,6 @@ void trace_ip_finish_output(struct pt_regs *ctx,
 {
     struct iphdr *iph = (struct iphdr *)(skb->head + skb->network_header);
 	struct transhdr *transh = (struct transhdr *)(skb->head + skb->transport_header);
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
     struct traffic_key key;
 
     if (sk->sk_family != AF_INET)
@@ -74,7 +73,7 @@ void trace_ip_finish_output(struct pt_regs *ctx,
         return;
 
     memset(&key, 0, sizeof(key));
-    key.pid = pid;
+    bpf_get_current_comm(&key.comm, sizeof(key.comm));
     key.protocol = iph->protocol;
     key.daddr = iph->daddr;
     key.dport = transh->dest;
@@ -85,7 +84,6 @@ void trace_ip_finish_output(struct pt_regs *ctx,
 
 void trace_tcp_cleanup_rbuf(struct pt_regs *ctx, struct sock *sk, int copied)
 {
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
     u32 laddr = sk->sk_rcv_saddr;
     int *ifindex = laddr2ifindex.lookup(&laddr);
     struct traffic_key key;
@@ -103,7 +101,7 @@ void trace_tcp_cleanup_rbuf(struct pt_regs *ctx, struct sock *sk, int copied)
         return;
 
     memset(&key, 0, sizeof(key));
-    key.pid = pid;
+    bpf_get_current_comm(&key.comm, sizeof(key.comm));
     key.protocol = TCP_PROTOCOL;
     key.daddr = sk->sk_daddr;
     key.dport = sk->sk_dport;
@@ -115,7 +113,6 @@ void trace_skb_consume_udp(struct pt_regs *ctx,
 {
     struct iphdr *iph = (struct iphdr *)(skb->head + skb->network_header);
 	struct transhdr *transh = (struct transhdr *)(skb->head + skb->transport_header);
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
     struct traffic_key key;
 
     if (sk->sk_family != AF_INET)
@@ -131,7 +128,7 @@ void trace_skb_consume_udp(struct pt_regs *ctx,
         return;
 
     memset(&key, 0, sizeof(key));
-    key.pid = pid;
+    bpf_get_current_comm(&key.comm, sizeof(key.comm));
     key.protocol = UDP_PROTOCOL;
     key.daddr = iph->saddr;
     key.dport = transh->source;
@@ -231,8 +228,8 @@ class Tool(object):
             traffic_infos = {}
             def merge_traffic(dir, dir_bytes):
                 for k, v in dir_bytes.items():
+                    comm = k.comm.decode("utf-8")
                     addr = (k.daddr << 32) | (k.dport << 16) | k.protocol
-                    pid = k.pid
                     if addr not in traffic_infos:
                         traffic_infos[addr] = {
                             "protocol": k.protocol == 0x06 and "tcp" or "udp",
@@ -242,21 +239,17 @@ class Tool(object):
                             "comm" : set()
                         }
                     traffic_infos[addr][dir] = traffic_infos[addr][dir] + v.value
-                    try:
-                        comm = open("/proc/%d/comm" % pid, "r").read().rstrip()
-                        if comm not in traffic_infos[addr]["comm"]:
-                            traffic_infos[addr]["comm"].add(comm)
-                    except Exception:
-                            continue
+                    if comm not in traffic_infos[addr]["comm"]:
+                        traffic_infos[addr]["comm"].add(comm)
 
             merge_traffic("tx", tx_bytes)
             merge_traffic("rx", rx_bytes)
 
-            print("%-10s %20s %10s %10s %20s" % ("PROTOCOL", "ADDRESS", "TX B/s", "RX B/s", "COMM"))
+            print("%-10s %25s %10s %10s %50s" % ("PROTOCOL", "ADDRESS", "TX B/s", "RX B/s", "COMM"))
             n = 0
             for _, v in sorted(traffic_infos.items(), key=lambda tup: tup[1]["tx"]+tup[1]["rx"], reverse=True):
                 comm_str = ",".join(v["comm"])
-                print("%-10s %20s %10d %10d %20s" %
+                print("%-10s %25s %10d %10d %50s" %
                      (v["protocol"],
                      v["address"],
                      v["tx"]  / self.args.second,
@@ -271,6 +264,7 @@ class Tool(object):
             else:
                 tx_bytes.clear()
                 rx_bytes.clear()
+                print()
 
 if __name__ == "__main__":
     try:
