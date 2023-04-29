@@ -15,84 +15,54 @@ bpf_text = """
 #include <uapi/linux/ptrace.h>
 #include <net/sock.h>
 #include <bcc/proto.h>
+#include <linux/ip.h>
+#include <linux/udp.h>
 
 #define UDP_PROTOCOL 0x11
 #define TCP_PROTOCOL 0x06
 
-struct iphdr {
-	u8	version:4,
-      		ihl:4;
-	u8	tos;
-	u16	tot_len;
-	u16	id;
-	u16	frag_off;
-	u8	ttl;
-	u8	protocol;
-	u16	check;
-	u32	saddr;
-	u32	daddr;
-};
-
-struct transhdr {
-    u16 source;
-    u16 dest;
-    u8  extra[0];
-};
-
 struct traffic_key {
     char comm[16];
-    u8  protocol;
-    u32 daddr;
-    u16 dport;
+    u8   protocol;
+    u32  daddr;
+    u16  dport;
 };
 
+struct sock_info {
+    struct sock *sk;
+    u32    daddr;
+    u16    dport;
+};
+
+BPF_HASH(laddr2ifindex, u32, int);
 BPF_HASH(tx_bytes, struct traffic_key);
 BPF_HASH(rx_bytes, struct traffic_key);
-BPF_HASH(laddr2ifindex, u32, int);
+BPF_HASH(sock_infos, u32, struct sock_info);
 
-void trace_ip_finish_output(struct pt_regs *ctx,
-                            struct net *net, struct sock *sk, struct sk_buff *skb)
+static void accumulate_traffic(int size, int egress, u8 protocol)
 {
-    struct iphdr *iph = (struct iphdr *)(skb->head + skb->network_header);
-	struct transhdr *transh = (struct transhdr *)(skb->head + skb->transport_header);
-    struct traffic_key key;
+    u32 tid = bpf_get_current_pid_tgid();
+    struct traffic_key key = {};
+    struct sock *sk;
+    struct sock_info *si;
+    u32 laddr;
+    int *ifindex;
+
+    si = sock_infos.lookup(&tid);
+    if (!si) {
+        return;
+    }
+
+    sk = si->sk;
+    if (!sk) {
+        return;
+    }
 
     if (sk->sk_family != AF_INET)
         return;
 
-    if (FILTER_IFINDEX != 0 && FILTER_IFINDEX != skb->dev->ifindex)
-        return;
-
-    if (iph->protocol != TCP_PROTOCOL && iph->protocol != UDP_PROTOCOL)
-        return;
-
-    if (FILTER_PROTOCOL != 0 && FILTER_PROTOCOL != iph->protocol)
-        return;
-
-    if (FILTER_PORT != 0 && FILTER_PORT != transh->dest)
-        return;
-
-    memset(&key, 0, sizeof(key));
-    bpf_get_current_comm(&key.comm, sizeof(key.comm));
-    key.protocol = iph->protocol;
-    key.daddr = iph->daddr;
-    key.dport = transh->dest;
-
-    u16 len = iph->tot_len;
-    tx_bytes.increment(key, ntohs(len));
-}
-
-void trace_tcp_cleanup_rbuf(struct pt_regs *ctx, struct sock *sk, int copied)
-{
-    u32 laddr = sk->sk_rcv_saddr;
-    int *ifindex = laddr2ifindex.lookup(&laddr);
-    struct traffic_key key;
-
-    if (sk->sk_family != AF_INET)
-        return;
-    
-    if (copied <= 0)
-        return;
+    laddr = sk->sk_rcv_saddr;
+    ifindex = laddr2ifindex.lookup(&laddr);
 
     if (FILTER_IFINDEX != 0 && (!ifindex || *ifindex != FILTER_IFINDEX))
         return;
@@ -100,40 +70,99 @@ void trace_tcp_cleanup_rbuf(struct pt_regs *ctx, struct sock *sk, int copied)
     if (FILTER_PORT != 0 && FILTER_PORT != sk->sk_dport)
         return;
 
-    memset(&key, 0, sizeof(key));
     bpf_get_current_comm(&key.comm, sizeof(key.comm));
-    key.protocol = TCP_PROTOCOL;
-    key.daddr = sk->sk_daddr;
-    key.dport = sk->sk_dport;
-    rx_bytes.increment(key, copied + 40);
+    key.protocol = protocol;
+    key.daddr = si->daddr;
+    key.dport = si->dport;
+
+    if (egress)
+        tx_bytes.increment(key, size);
+    else
+        rx_bytes.increment(key, size);
 }
 
-void trace_skb_consume_udp(struct pt_regs *ctx,
-                           struct sock *sk, struct sk_buff *skb, int size)
+int tcp_func_entry(struct pt_regs *ctx, struct sock *sk)
+{
+    u32 tid = bpf_get_current_pid_tgid();
+    struct sock_info si = {0};
+    si.sk = sk;
+    si.daddr = sk->sk_daddr;
+    si.dport = sk->sk_dport;
+    sock_infos.update(&tid, &si);
+}
+
+int tcp_sendmsg_ret(struct pt_regs *ctx)
+{
+    int ret = PT_REGS_RC(ctx);
+    if (ret > 0)
+        accumulate_traffic(ret, 1, TCP_PROTOCOL);
+    return 0;
+}
+
+int tcp_recvmsg_ret(struct pt_regs *ctx)
+{
+    int ret = PT_REGS_RC(ctx);
+    if (ret > 0)
+        accumulate_traffic(ret, 0, TCP_PROTOCOL);
+    return 0;
+}
+
+int udp_sendmsg_entry(struct pt_regs *ctx, struct sock *sk, struct msghdr *msg, size_t len)
+{
+    u32 daddr = sk->sk_daddr;
+    u16 dport = sk->sk_dport;
+    struct sockaddr_in *usin = msg->msg_name;
+    u32 tid = bpf_get_current_pid_tgid();
+    struct sock_info si = {0};
+
+    if (daddr == 0) {
+        daddr = usin->sin_addr.s_addr;
+                dport = usin->sin_port;
+    }
+
+    si.daddr = daddr;
+    si.dport = dport;
+    si.sk = sk;
+    sock_infos.update(&tid, &si);
+    return 0;
+}
+
+int udp_sendmsg_ret(struct pt_regs *ctx)
+{
+
+    int ret = PT_REGS_RC(ctx);
+    if (ret > 0)
+        accumulate_traffic(ret, 1, UDP_PROTOCOL);
+
+    return 0;
+}
+
+int skb_consume_udp_entry(struct pt_regs *ctx, struct sock *sk, struct sk_buff *skb, int len)
 {
     struct iphdr *iph = (struct iphdr *)(skb->head + skb->network_header);
-	struct transhdr *transh = (struct transhdr *)(skb->head + skb->transport_header);
+    struct udphdr *udph = (struct udphdr *)(skb->head + skb->transport_header);
     struct traffic_key key;
 
     if (sk->sk_family != AF_INET)
-        return;
+        return 0;
 
-    if (size <= 0)
-        return;
+    if (len <= 0)
+        return 0;
 
     if (FILTER_IFINDEX != 0 && FILTER_IFINDEX != skb->skb_iif)
-        return;
+        return 0;
 
-    if (FILTER_PORT != 0 && FILTER_PORT != transh->source)
-        return;
+    if (FILTER_PORT != 0 && FILTER_PORT != udph->source)
+        return 0;
 
     memset(&key, 0, sizeof(key));
     bpf_get_current_comm(&key.comm, sizeof(key.comm));
     key.protocol = UDP_PROTOCOL;
     key.daddr = iph->saddr;
-    key.dport = transh->source;
-    u16 len = iph->tot_len;
-    rx_bytes.increment(key, ntohs(len));
+    key.dport = udph->source;
+    u16 len2 = iph->tot_len;
+    rx_bytes.increment(key, len);
+    return 0;
 }
 """
 
@@ -192,21 +221,28 @@ class Tool(object):
 
     def attach(self):
         if self.args.tcp:
-            self.bpf.attach_kprobe(event = "tcp_cleanup_rbuf", fn_name = "trace_tcp_cleanup_rbuf")
+            self.bpf.attach_kprobe(event = "tcp_sendmsg", fn_name = "tcp_func_entry")
+            self.bpf.attach_kprobe(event = "tcp_recvmsg", fn_name = "tcp_func_entry")
+            self.bpf.attach_kretprobe(event = "tcp_sendmsg", fn_name = "tcp_sendmsg_ret")
+            self.bpf.attach_kretprobe(event = "tcp_recvmsg", fn_name = "tcp_recvmsg_ret")
 
         if self.args.udp:
-            self.bpf.attach_kprobe(event = "skb_consume_udp", fn_name = "trace_skb_consume_udp")
-
-        self.bpf.attach_kprobe(event = "ip_finish_output", fn_name = "trace_ip_finish_output")
+            self.bpf.attach_kprobe(event = "udp_sendmsg", fn_name = "udp_sendmsg_entry")
+            self.bpf.attach_kprobe(event = "skb_consume_udp", fn_name = "skb_consume_udp_entry")
+            self.bpf.attach_kretprobe(event = "udp_sendmsg", fn_name = "udp_sendmsg_ret")
 
     def detach(self):
         if self.args.tcp:
-            self.bpf.detach_kprobe(event="tcp_cleanup_rbuf")
+            self.bpf.detach_kprobe(event="tcp_sendmsg")
+            self.bpf.detach_kprobe(event="tcp_recvmsg")
+            self.bpf.detach_kretprobe(event="tcp_sendmsg")
+            self.bpf.detach_kretprobe(event="tcp_recvmsg")
 
         if self.args.udp:
+            self.bpf.detach_kprobe(event="udp_sendmsg")
             self.bpf.detach_kprobe(event="skb_consume_udp")
+            self.bpf.detach_kretprobe(event="udp_sendmsg")
 
-        self.bpf.detach_kprobe(event="ip_finish_output")
 
     def run(self):
         print("start record traffic\"... Hit Ctrl-C to end.")
@@ -239,21 +275,21 @@ class Tool(object):
                             "comm" : set()
                         }
                     traffic_infos[addr][dir] = traffic_infos[addr][dir] + v.value
-                    if not (comm.startswith("swapper") or comm.startswith("ksoftirqd")) and comm not in traffic_infos[addr]["comm"]:
+                    if comm not in traffic_infos[addr]["comm"]:
                         traffic_infos[addr]["comm"].add(comm)
 
             merge_traffic("tx", tx_bytes)
             merge_traffic("rx", rx_bytes)
 
-            print("%-10s %25s %10s %10s %50s" % ("PROTOCOL", "ADDRESS", "TX B/s", "RX B/s", "COMM"))
+            print("%-10s %25s %10s %10s %50s" % ("PROTOCOL", "ADDRESS", "TX Mb/s", "RX Mb/s", "COMM"))
             n = 0
             for _, v in sorted(traffic_infos.items(), key=lambda tup: tup[1]["tx"]+tup[1]["rx"], reverse=True):
                 comm_str = ",".join(v["comm"])
-                print("%-10s %25s %10d %10d %50s" %
+                print("%-10s %25s %10.2f %10.2f %50s" %
                      (v["protocol"],
                      v["address"],
-                     v["tx"]  / self.args.second,
-                     v["rx"]  / self.args.second,
+                     v["tx"] * 8 / 1024.0 / 1024.0 / self.args.second,
+                     v["rx"] * 8 / 1024.0 / 1024.0 / self.args.second,
                      comm_str))
                 n = n + 1
                 if n >= self.args.number:
@@ -271,3 +307,4 @@ if __name__ == "__main__":
         Tool().run()
     except Exception:
         traceback.print_exc()
+
